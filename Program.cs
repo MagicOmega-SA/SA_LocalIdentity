@@ -54,11 +54,20 @@ namespace MoIdentityTool
     /// <summary>一键把游戏服务器指向本机，并改写 USER 行里的机器码。</summary>
     internal sealed class IdentityForm : Form
     {
+#if SA_LOG
         private const int MaxObservations = 200;
+#endif
         private const string DefaultPorts = "6660,6666,6667,6668,6669,7000,8080";
 
         // 机器码的长度上限包含可选的 ~ 前缀。
         private readonly TextBox machine = new TextBox { Dock = DockStyle.Fill, MaxLength = 10 };
+        // 房间比对用的文件校验值，留空则只改机器码。
+        private readonly TextBox gameHash = new TextBox
+        {
+            AccessibleName = "房间文件哈希",
+            Dock = DockStyle.Fill,
+            MaxLength = 40
+        };
         private readonly TextBox listenAddress = new TextBox
         {
             AccessibleName = "监听 IP",
@@ -97,6 +106,7 @@ namespace MoIdentityTool
         private readonly CheckBox autoApply = new CheckBox { Text = "自动跟随建连日志", AutoSize = true };
         private readonly Button start = new Button { Text = "一键启用", AutoSize = true };
         private readonly Button stop = new Button { Text = "停止代理", AutoSize = true, Enabled = false };
+#if SA_LOG
         private readonly ListView observations = new ListView
         {
             AccessibleName = "识别码改写与服务器回包记录",
@@ -106,9 +116,11 @@ namespace MoIdentityTool
             GridLines = true,
             HeaderStyle = ColumnHeaderStyle.Nonclickable
         };
+#endif
         private readonly bool elevated;
         private IdentityRelay relay;
         private string appliedPorts = string.Empty;
+        private string defaultHashSource = string.Empty;
         private bool waitingForOriginalIdent;
         private bool hostsApplied;
         private int hostCount;
@@ -128,14 +140,20 @@ namespace MoIdentityTool
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Font;
             Font = new Font("Microsoft YaHei UI", 10F);
+#if SA_LOG
             ClientSize = new Size(1000, 560);
             MinimumSize = new Size(880, 460);
+#else
+            ClientSize = new Size(1000, 420);
+            MinimumSize = new Size(880, 400);
+#endif
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 3, RowCount = 9 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 3, RowCount = 10 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92F));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
@@ -156,6 +174,7 @@ namespace MoIdentityTool
             layout.Controls.Add(upstreamHost, 1, 3);
             layout.Controls.Add(upstreamPort, 2, 3);
             AddField(layout, 4, "机器码", machine, () => machine.Text = IdentityProfile.RandomIdent());
+            AddField(layout, 5, "文件哈希", gameHash, "计算", ChooseCleanInstall);
 
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
             Button randomBoth = MakeButton("随机生成", Randomize);
@@ -173,16 +192,18 @@ namespace MoIdentityTool
                 if (autoApply.Checked)
                     StartListening();
             };
-            AddFullWidth(layout, buttons, 5);
-            AddFullWidth(layout, status, 6);
-            AddFullWidth(layout, cncnetTarget, 7);
+            AddFullWidth(layout, buttons, 6);
+            AddFullWidth(layout, status, 7);
+            AddFullWidth(layout, cncnetTarget, 8);
+#if SA_LOG
             observations.Columns.Add("日志时间", 135);
             observations.Columns.Add("来源", 94);
             observations.Columns.Add("服务器 IP", 150);
             observations.Columns.Add("昵称", 140);
             observations.Columns.Add("机器码", 110);
             observations.Columns.Add("IP 码（回包）", 245);
-            AddFullWidth(layout, observations, 8);
+            AddFullWidth(layout, observations, 9);
+#endif
 
             preferences = new IdentityPreferences(settingsPath);
             RestoreIdentity(clientLogPaths);
@@ -205,7 +226,7 @@ namespace MoIdentityTool
 
         private void RestoreIdentity(string[] clientLogPaths)
         {
-            string saved = null;
+            string[] saved = null;
             try
             {
                 saved = preferences.Load();
@@ -215,7 +236,10 @@ namespace MoIdentityTool
                 status.Text = "读取识别码设置失败。" + error.Message;
             }
 
-            machine.Text = saved ?? string.Empty;
+            machine.Text = saved != null && saved.Length > 0 ? saved[0] : string.Empty;
+            gameHash.Text = saved != null && saved.Length > 1 ? saved[1] : string.Empty;
+            // 没填过文件哈希时，直接按纯净版目录算一次，进房间就不会再报文件不一致。
+            bool hashPrepared = EnsureDefaultHash();
             if (string.IsNullOrWhiteSpace(machine.Text))
                 machine.Text = CnCNetLogMonitor.FindLastSubmittedIdent(clientLogPaths) ?? string.Empty;
 
@@ -232,11 +256,37 @@ namespace MoIdentityTool
             waitingForOriginalIdent = string.IsNullOrWhiteSpace(machine.Text);
             if (status.Text.Length == 0)
             {
-                if (waitingForOriginalIdent)
+                if (hashPrepared)
+                {
+                    status.Text = "已按 " + defaultHashSource + " 算出文件哈希 " + gameHash.Text + "，点「一键启用」。";
+                    if (waitingForOriginalIdent)
+                        status.Text += " 机器码等原版客户端日志提供。";
+                }
+                else if (waitingForOriginalIdent)
                     status.Text = "等待原版客户端日志提供机器码。";
                 else
                     status.Text = "准备好后点「一键启用」。";
             }
+        }
+
+        /// <summary>文件哈希为空时，用纯净版目录算一次填进去。找不到参照目录就返回 false。</summary>
+        private bool EnsureDefaultHash()
+        {
+            if (!string.IsNullOrWhiteSpace(gameHash.Text))
+                return false;
+
+            string reference = GuessReferenceRoot();
+            if (string.IsNullOrEmpty(reference))
+                return false;
+
+            string computed;
+            string error;
+            if (!GameFileHash.TryCompute(reference, out computed, out error))
+                return false;
+
+            gameHash.Text = computed;
+            defaultHashSource = reference;
+            return true;
         }
 
         /// <summary>上次异常退出可能残留 hosts 段落，启动时先清掉，否则游戏连不上服务器。</summary>
@@ -254,7 +304,7 @@ namespace MoIdentityTool
 
         private void SaveIdentity()
         {
-            try { preferences.Save(machine.Text); }
+            try { preferences.Save(machine.Text, gameHash.Text); }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
             {
                 MessageBox.Show(this, "保存识别码失败。" + error.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -339,9 +389,67 @@ namespace MoIdentityTool
         /// <summary>在指定行放置一个带独立随机按钮的输入字段。</summary>
         private static void AddField(TableLayoutPanel layout, int row, string name, TextBox field, Action randomize)
         {
+            AddField(layout, row, name, field, "随机生成", randomize);
+        }
+
+        /// <summary>在指定行放置一个输入字段，右侧按钮的文字与操作由调用方决定。</summary>
+        private static void AddField(TableLayoutPanel layout, int row, string name, TextBox field, string buttonText, Action handler)
+        {
             layout.Controls.Add(MakeLabel(name), 0, row);
             layout.Controls.Add(field, 1, row);
-            layout.Controls.Add(MakeButton("随机生成", randomize), 2, row);
+            layout.Controls.Add(MakeButton(buttonText, handler), 2, row);
+        }
+
+        /// <summary>选择参照用的游戏文件夹，按客户端算法算出房间文件校验值。</summary>
+        private void ChooseCleanInstall()
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "选择要作为参照的游戏文件夹（里面应有 Resources\\FHCConfig.ini）";
+                dialog.ShowNewFolderButton = false;
+                string guess = GuessReferenceRoot();
+                if (guess != null)
+                    dialog.SelectedPath = guess;
+
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                string hash;
+                string error;
+                if (!GameFileHash.TryCompute(dialog.SelectedPath, out hash, out error))
+                {
+                    status.Text = "计算文件哈希失败：" + error;
+                    return;
+                }
+
+                gameHash.Text = hash;
+                status.Text = "已按 " + dialog.SelectedPath + " 算出文件哈希 " + hash + "。";
+            }
+        }
+
+        /// <summary>猜一个参照安装的位置：工作区里通常有纯净版与修改版两个文件夹。</summary>
+        private static string GuessReferenceRoot()
+        {
+            string folder = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates =
+            {
+                Path.Combine(folder, "..", "..", "纯净版MO", "Mental Omega"),
+                Path.Combine(folder, "..", "纯净版MO", "Mental Omega"),
+                Path.Combine(folder, "..", "..", "..", "纯净版MO", "Mental Omega")
+            };
+
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    string full = Path.GetFullPath(candidate);
+                    if (File.Exists(Path.Combine(full, GameFileHash.ConfigRelativePath)))
+                        return full;
+                }
+                catch (ArgumentException) { }
+                catch (NotSupportedException) { }
+            }
+            return null;
         }
 
         /// <summary>让说明、状态和按钮区横跨表格的所有列。</summary>
@@ -379,6 +487,9 @@ namespace MoIdentityTool
 
             if (string.IsNullOrWhiteSpace(upstreamHost.Text))
                 TakeUpstreamFromLog();
+
+            // 用户清空过文件哈希时，仍然按纯净版补齐，保证默认就会改写校验值。
+            EnsureDefaultHash();
 
             ApplyHosts();
             ApplyProfile();
@@ -503,6 +614,15 @@ namespace MoIdentityTool
 
             // 回填规范化后的字段，例如把六位十六进制简写扩展为 MO.XXXXXX。
             machine.Text = requested.Ident;
+            string hashValue = gameHash.Text.Trim();
+            if (hashValue.Length > 0 && !GameFileHash.IsHash(hashValue))
+            {
+                status.Text = "文件哈希请填 40 位十六进制，或点「计算」从游戏文件夹生成；留空则只改机器码。";
+                UpdateServerButtons();
+                return;
+            }
+            hashValue = hashValue.ToLowerInvariant();
+            gameHash.Text = hashValue;
             string portsKey = string.Join(",", ports.Select(value => value.ToString()).ToArray());
             try
             {
@@ -514,20 +634,27 @@ namespace MoIdentityTool
                 if (changed)
                 {
                     // 新代理构造成功后才替换旧代理。绑定失败时旧连接仍可使用。
-                    var created = new IdentityRelay(address, ports, requested, upstream, upstreamPortValue);
+                    var created = new IdentityRelay(address, ports, requested, upstream, upstreamPortValue, hashValue);
+#if SA_LOG
                     created.Observation += AddRelayObservation;
+#endif
                     IdentityRelay previous = relay;
                     relay = created;
                     if (previous != null)
                         previous.Dispose();
                 }
                 else
+                {
                     relay.Apply(requested);
+                    relay.ApplyGameHash(hashValue);
+                }
 
                 appliedPorts = portsKey;
                 listenAddress.Text = relay.Address.ToString();
                 status.Text = "正在改写 " + relay.Address + ":" + appliedPorts + " → 上游 " + relay.UpstreamHost + ":" +
                     relay.UpstreamPort + "，识别码 " + requested.Ident + "。";
+                if (hashValue.Length > 0)
+                    status.Text += " 房间文件哈希按 " + hashValue.Substring(0, 8) + "… 上报，进房间不会再报文件不一致。";
                 if (hostsApplied)
                     status.Text += " 已把 " + hostCount + " 个服务器域名指向本机，退出时自动还原。";
                 else if (!elevated)
@@ -572,6 +699,7 @@ namespace MoIdentityTool
             return string.Equals(upstream, "localhost", StringComparison.OrdinalIgnoreCase);
         }
 
+#if SA_LOG
         /// <summary>把改写代理的后台记录转发到界面线程。</summary>
         private void AddRelayObservation(string time, string action, string remote, string nick, string value, string detail)
         {
@@ -589,6 +717,7 @@ namespace MoIdentityTool
 
             AddLogObservation(time, action, remote, nick, value, detail);
         }
+#endif
 
         private void AddLogObservation(string time, string direction, string serverIp, string nick, string ident, string hostname)
         {
@@ -606,9 +735,11 @@ namespace MoIdentityTool
                 }
             }
 
+#if SA_LOG
             observations.Items.Insert(0, new ListViewItem(new[] { time, direction, serverIp ?? "—", nick, ident, hostname }));
             if (observations.Items.Count > MaxObservations)
                 observations.Items.RemoveAt(MaxObservations);
+#endif
         }
 
         /// <summary>释放当前改写代理，并还原 hosts。</summary>

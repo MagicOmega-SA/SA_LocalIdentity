@@ -1,15 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
-$gameDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'Mental Omega'
-if (!(Test-Path -LiteralPath $gameDirectory -PathType Container)) {
-    throw "Game directory not found: $gameDirectory"
-}
-
 $staging = Join-Path ([IO.Path]::GetTempPath()) ('SA_LocalIdentity-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($staging)
-$stagedDll = Join-Path $staging 'SA_LocalIdentity.dll'
-# The published EXE and DLL have the same file stem, but need different managed assembly names.
-$stagedExe = Join-Path $staging 'SA_LocalIdentity.Host.exe'
+$outputFiles = [ordered]@{}
+$stagedFiles = @()
 
 Push-Location -LiteralPath $PSScriptRoot
 try {
@@ -22,24 +16,32 @@ try {
     $references = 'mscorlib.dll', 'System.dll', 'System.Core.dll' | ForEach-Object {
         '/reference:' + (Join-Path $framework $_)
     }
-    $options = '/nologo', '/noconfig', '/nostdlib+', '/platform:anycpu', '/optimize+', '/warnaserror+'
-
-    & $dotnet $compiler @options @references /target:library ("/out:$stagedDll") IdentityRelay.cs
-    if ($LASTEXITCODE -ne 0) { throw 'Could not build SA_LocalIdentity.dll.' }
-
+    $options = '/nologo', '/noconfig', '/nostdlib+', '/platform:anycpu', '/optimize+', '/warnaserror+', '/deterministic+'
     $uiReferences = 'System.Drawing.dll', 'System.Windows.Forms.dll' | ForEach-Object {
         '/reference:' + (Join-Path $framework $_)
     }
-    & $dotnet $compiler @options @references @uiReferences /target:winexe ("/reference:$stagedDll") ("/out:$stagedExe") Program.cs CnCNetLogMonitor.cs IdentityPreferences.cs HostsRedirector.cs
-    if ($LASTEXITCODE -ne 0) { throw 'Could not build the Windows Forms host.' }
+    foreach ($name in 'SA_LocalIdentity', 'SA_LocalIdentity.nolog') {
+        $defines = @()
+        if ($name -eq 'SA_LocalIdentity') { $defines += '/define:SA_LOG' }
 
-    foreach ($destination in $PSScriptRoot, $gameDirectory) {
-        Copy-Item -LiteralPath $stagedDll -Destination (Join-Path $destination 'SA_LocalIdentity.dll') -Force
-        Copy-Item -LiteralPath $stagedExe -Destination (Join-Path $destination 'SA_LocalIdentity.exe') -Force
+        $stagedDll = Join-Path $staging "$name.dll"
+        # The host and its library need distinct managed assembly names.
+        $stagedExe = Join-Path $staging "$name.Host.exe"
+        $stagedFiles += $stagedDll, $stagedExe
+        & $dotnet $compiler @options @references @defines /target:library ("/out:$stagedDll") IdentityRelay.cs GameFileHash.cs
+        if ($LASTEXITCODE -ne 0) { throw "Could not build $name.dll." }
+        & $dotnet $compiler @options @references @uiReferences @defines /target:winexe ("/reference:$stagedDll") ("/out:$stagedExe") Program.cs CnCNetLogMonitor.cs IdentityPreferences.cs HostsRedirector.cs
+        if ($LASTEXITCODE -ne 0) { throw "Could not build $name.exe." }
+
+        $outputFiles["$name.dll"] = $stagedDll
+        $outputFiles["$name.exe"] = $stagedExe
+    }
+
+    foreach ($fileName in $outputFiles.Keys) {
+        Copy-Item -LiteralPath $outputFiles[$fileName] -Destination (Join-Path $PSScriptRoot $fileName) -Force
     }
 } finally {
     Pop-Location
-    [IO.File]::Delete($stagedDll)
-    [IO.File]::Delete($stagedExe)
+    foreach ($filePath in $stagedFiles) { [IO.File]::Delete($filePath) }
     [IO.Directory]::Delete($staging)
 }

@@ -63,8 +63,15 @@ namespace MoIdentityTool
         private readonly List<int> ports = new List<int>();
         private readonly List<TcpClient> clients = new List<TcpClient>();
         private readonly object gate = new object();
+        // CTCP 包体以 \u0001 包裹，房间文件校验用的是 FHSH，指认作弊用的是 MM 与 IHSH。
+        private const string FileHashTag = "\u0001FHSH ";
+        private const string CheaterTag = "\u0001MM ";
+        private const string CheatTag = "\u0001IHSH ";
+
         // UI 线程可更新配置，连接线程读取其引用。
         private volatile IdentityProfile profile;
+        // 空串表示不改写文件校验值。
+        private volatile string gameHash = string.Empty;
         private readonly string upstreamHost;
         private readonly int upstreamPort;
         private bool disposed;
@@ -79,6 +86,8 @@ namespace MoIdentityTool
         public string UpstreamHost { get { return upstreamHost; } }
         /// <summary>当前转发的上游端口。</summary>
         public int UpstreamPort { get { return upstreamPort; } }
+        /// <summary>转发时替换房间文件校验值用的哈希，空串表示不改写。</summary>
+        public string GameHash { get { return gameHash; } }
         /// <summary>转发过程中的记录，参数依次为时间、动作、对方、昵称、值、说明。</summary>
         public event Action<string, string, string, string, string, string> Observation;
 
@@ -97,6 +106,15 @@ namespace MoIdentityTool
         /// <summary>同时监听多个端口。个别端口被占用时跳过，全部失败才报错。</summary>
         /// <exception cref="InvalidOperationException">没有任何端口能绑定。</exception>
         public IdentityRelay(IPAddress listenAddress, IEnumerable<int> listenPorts, IdentityProfile initialProfile, string upstreamHost, int upstreamPort)
+            : this(listenAddress, listenPorts, initialProfile, upstreamHost, upstreamPort, null)
+        {
+        }
+
+        /// <summary>同时监听多个端口，并按需替换房间文件校验值。</summary>
+        /// <param name="gameHash">要比对的房间文件哈希，空值表示只改机器码。</param>
+        /// <exception cref="InvalidOperationException">没有任何端口能绑定。</exception>
+        public IdentityRelay(IPAddress listenAddress, IEnumerable<int> listenPorts, IdentityProfile initialProfile,
+            string upstreamHost, int upstreamPort, string gameHash)
         {
             if (listenAddress == null)
                 throw new ArgumentNullException("listenAddress");
@@ -117,6 +135,7 @@ namespace MoIdentityTool
             this.upstreamHost = upstreamHost.Trim();
             this.upstreamPort = upstreamPort;
             Address = listenAddress;
+            ApplyGameHash(gameHash);
 
             foreach (int candidate in wanted)
             {
@@ -158,6 +177,23 @@ namespace MoIdentityTool
         {
             if (updatedProfile != null)
                 profile = updatedProfile;
+        }
+
+        /// <summary>替换房间文件校验值。空值表示不改写，只做机器码替换。</summary>
+        /// <exception cref="ArgumentException">填了内容但不是 40 位十六进制。</exception>
+        public void ApplyGameHash(string updatedHash)
+        {
+            string value = (updatedHash ?? string.Empty).Trim();
+            if (value.Length == 0)
+            {
+                gameHash = string.Empty;
+                return;
+            }
+
+            if (!GameFileHash.IsHash(value))
+                throw new ArgumentException("房间文件校验值应为 40 位十六进制，或点「计算」从游戏文件夹生成。", "updatedHash");
+
+            gameHash = value.ToLowerInvariant();
         }
 
         /// <summary>在单个监听端口上持续接受连接，直至监听停止或套接字报错。</summary>
@@ -245,11 +281,16 @@ namespace MoIdentityTool
 
                 string outgoing;
                 if (rewrite)
+                {
                     outgoing = Rewrite(line, state);
+                }
                 else
                 {
                     ObserveServerReply(line, state);
-                    outgoing = line;
+                    outgoing = FilterServerLine(line, state);
+                    // 被判定为作弊的红字通知直接丢掉，不再转给客户端。
+                    if (outgoing == null)
+                        continue;
                 }
 
                 try
@@ -261,7 +302,7 @@ namespace MoIdentityTool
             }
         }
 
-        /// <summary>记录客户端昵称，并把 USER 行里的机器码换成当前配置值。</summary>
+        /// <summary>记录客户端昵称，并把 USER 行与房间文件校验值换成当前配置。</summary>
         private string Rewrite(string line, RelayState state)
         {
             if (line.StartsWith("NICK ", StringComparison.OrdinalIgnoreCase))
@@ -271,7 +312,7 @@ namespace MoIdentityTool
             }
 
             if (!line.StartsWith("USER ", StringComparison.OrdinalIgnoreCase))
-                return line;
+                return RewriteFileHash(line, state);
 
             int identStart = line.IndexOf(' ') + 1;
             int identEnd = line.IndexOf(' ', identStart);
@@ -304,6 +345,68 @@ namespace MoIdentityTool
             if (dot < 0)
                 return target;
             return token.Substring(0, dot + 1) + code;
+        }
+
+        /// <summary>
+        /// 把 CTCP 包体里的房间文件校验值换成要上报的值。客户端加入房间时会向频道发送
+        /// NOTICE #chan :\u0001FHSH &lt;40 位十六进制&gt;\u0001，房主据此判断双方文件是否一致。
+        /// 换成房主认可的值后，比对通过，房主不会再广播指认。
+        /// </summary>
+        private string RewriteFileHash(string line, RelayState state)
+        {
+            int marker = line.IndexOf(FileHashTag, StringComparison.Ordinal);
+            if (marker < 0)
+                return line;
+
+            int start = marker + FileHashTag.Length;
+            int end = line.IndexOf('\u0001', start);
+            if (end < 0 || end - start != 40)
+                return line;
+
+            string original = line.Substring(start, end - start);
+            if (!GameFileHash.IsHash(original))
+                return line;
+
+            string target = gameHash;
+            if (string.IsNullOrEmpty(target))
+                return line;
+
+            if (string.Equals(original, target, StringComparison.OrdinalIgnoreCase))
+                return line;
+
+            Report("改写文件哈希", upstreamHost + ":" + upstreamPort, state.Nick, target, original);
+            return line.Substring(0, start) + target + line.Substring(end);
+        }
+
+        /// <summary>
+        /// 处理服务器发回的行：丢掉指向本机的作弊通知。
+        /// 服务器认为文件不一致时回 \u0001MM &lt;昵称&gt;\u0001（大厅）或 \u0001IHSH &lt;昵称&gt;\u0001（读档大厅）。
+        /// </summary>
+        private string FilterServerLine(string line, RelayState state)
+        {
+            if (string.IsNullOrEmpty(state.Nick))
+                return line;
+
+            foreach (string tag in new[] { CheaterTag, CheatTag })
+            {
+                int marker = line.IndexOf(tag, StringComparison.Ordinal);
+                if (marker < 0)
+                    continue;
+
+                int start = marker + tag.Length;
+                int end = line.IndexOf('\u0001', start);
+                if (end < 0)
+                    continue;
+
+                string who = line.Substring(start, end - start).Trim();
+                if (!string.Equals(who, state.Nick, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                Report("屏蔽红字", upstreamHost + ":" + upstreamPort, state.Nick, who, line.Trim());
+                return null;
+            }
+
+            return line;
         }
 
         /// <summary>从服务器回包中取出本连接被分配的完整识别码，昵称后的第一处 @ 即主机名。</summary>
@@ -340,6 +443,7 @@ namespace MoIdentityTool
         }
 
         /// <summary>向观察者推送一条转发记录。</summary>
+        [System.Diagnostics.Conditional("SA_LOG")]
         private void Report(string action, string remote, string nick, string value, string detail)
         {
             Action<string, string, string, string, string, string> handler = Observation;
@@ -397,7 +501,7 @@ namespace MoIdentityTool
                 Close(client);
         }
 
-        /// <summary>单个转发连接内共享的状态，用于记录昵称和最近一次服务器分配的识别码。</summary>
+        /// <summary>单个转发连接内共享的状态，用于记录昵称与服务器分配的识别码。</summary>
         private sealed class RelayState
         {
             public string Nick = string.Empty;
