@@ -65,8 +65,6 @@ namespace MoIdentityTool
         private readonly object gate = new object();
         // CTCP 包体以 \u0001 包裹，房间文件校验用的是 FHSH，指认作弊用的是 MM 与 IHSH。
         private const string FileHashTag = "\u0001FHSH ";
-        private const string CheaterTag = "\u0001MM ";
-        private const string CheatTag = "\u0001IHSH ";
 
         // UI 线程可更新配置，连接线程读取其引用。
         private volatile IdentityProfile profile;
@@ -287,10 +285,7 @@ namespace MoIdentityTool
                 else
                 {
                     ObserveServerReply(line, state);
-                    outgoing = FilterServerLine(line, state);
-                    // 被判定为作弊的红字通知直接丢掉，不再转给客户端。
-                    if (outgoing == null)
-                        continue;
+                    outgoing = line;
                 }
 
                 try
@@ -376,37 +371,6 @@ namespace MoIdentityTool
 
             Report("改写文件哈希", upstreamHost + ":" + upstreamPort, state.Nick, target, original);
             return line.Substring(0, start) + target + line.Substring(end);
-        }
-
-        /// <summary>
-        /// 处理服务器发回的行：丢掉指向本机的作弊通知。
-        /// 服务器认为文件不一致时回 \u0001MM &lt;昵称&gt;\u0001（大厅）或 \u0001IHSH &lt;昵称&gt;\u0001（读档大厅）。
-        /// </summary>
-        private string FilterServerLine(string line, RelayState state)
-        {
-            if (string.IsNullOrEmpty(state.Nick))
-                return line;
-
-            foreach (string tag in new[] { CheaterTag, CheatTag })
-            {
-                int marker = line.IndexOf(tag, StringComparison.Ordinal);
-                if (marker < 0)
-                    continue;
-
-                int start = marker + tag.Length;
-                int end = line.IndexOf('\u0001', start);
-                if (end < 0)
-                    continue;
-
-                string who = line.Substring(start, end - start).Trim();
-                if (!string.Equals(who, state.Nick, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                Report("屏蔽红字", upstreamHost + ":" + upstreamPort, state.Nick, who, line.Trim());
-                return null;
-            }
-
-            return line;
         }
 
         /// <summary>从服务器回包中取出本连接被分配的完整识别码，昵称后的第一处 @ 即主机名。</summary>

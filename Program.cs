@@ -68,6 +68,12 @@ namespace MoIdentityTool
             Dock = DockStyle.Fill,
             MaxLength = 40
         };
+        // 参照用的游戏目录，手动填写；默认取工具同级的 Mental Omega。
+        private readonly TextBox hashRoot = new TextBox
+        {
+            AccessibleName = "哈希参照目录",
+            Dock = DockStyle.Fill
+        };
         private readonly TextBox listenAddress = new TextBox
         {
             AccessibleName = "监听 IP",
@@ -121,6 +127,8 @@ namespace MoIdentityTool
         private IdentityRelay relay;
         private string appliedPorts = string.Empty;
         private string defaultHashSource = string.Empty;
+        private bool defaultHashBuiltIn;
+        private bool autoStarted;
         private bool waitingForOriginalIdent;
         private bool hostsApplied;
         private int hostCount;
@@ -148,11 +156,12 @@ namespace MoIdentityTool
             MinimumSize = new Size(880, 400);
 #endif
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 3, RowCount = 10 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 3, RowCount = 11 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92F));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
@@ -174,7 +183,8 @@ namespace MoIdentityTool
             layout.Controls.Add(upstreamHost, 1, 3);
             layout.Controls.Add(upstreamPort, 2, 3);
             AddField(layout, 4, "机器码", machine, () => machine.Text = IdentityProfile.RandomIdent());
-            AddField(layout, 5, "文件哈希", gameHash, "计算", ChooseCleanInstall);
+            AddField(layout, 5, "文件哈希", gameHash, "计算", ChooseReferenceRoot);
+            AddField(layout, 6, "参照目录", hashRoot, "浏览", BrowseReferenceRoot);
 
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
             Button randomBoth = MakeButton("随机生成", Randomize);
@@ -192,9 +202,9 @@ namespace MoIdentityTool
                 if (autoApply.Checked)
                     StartListening();
             };
-            AddFullWidth(layout, buttons, 6);
-            AddFullWidth(layout, status, 7);
-            AddFullWidth(layout, cncnetTarget, 8);
+            AddFullWidth(layout, buttons, 7);
+            AddFullWidth(layout, status, 8);
+            AddFullWidth(layout, cncnetTarget, 9);
 #if SA_LOG
             observations.Columns.Add("日志时间", 135);
             observations.Columns.Add("来源", 94);
@@ -202,7 +212,7 @@ namespace MoIdentityTool
             observations.Columns.Add("昵称", 140);
             observations.Columns.Add("机器码", 110);
             observations.Columns.Add("IP 码（回包）", 245);
-            AddFullWidth(layout, observations, 9);
+            AddFullWidth(layout, observations, 10);
 #endif
 
             preferences = new IdentityPreferences(settingsPath);
@@ -238,7 +248,10 @@ namespace MoIdentityTool
 
             machine.Text = saved != null && saved.Length > 0 ? saved[0] : string.Empty;
             gameHash.Text = saved != null && saved.Length > 1 ? saved[1] : string.Empty;
-            // 没填过文件哈希时，直接按纯净版目录算一次，进房间就不会再报文件不一致。
+            hashRoot.Text = saved != null && saved.Length > 2 && saved[2].Length > 0
+                ? saved[2]
+                : DefaultReferenceRoot();
+            // 没填过文件哈希时，按参照目录算一次；目录不可用就留空，由用户手动指定。
             bool hashPrepared = EnsureDefaultHash();
             if (string.IsNullOrWhiteSpace(machine.Text))
                 machine.Text = CnCNetLogMonitor.FindLastSubmittedIdent(clientLogPaths) ?? string.Empty;
@@ -258,7 +271,9 @@ namespace MoIdentityTool
             {
                 if (hashPrepared)
                 {
-                    status.Text = "已按 " + defaultHashSource + " 算出文件哈希 " + gameHash.Text + "，点「一键启用」。";
+                    status.Text = defaultHashBuiltIn
+                        ? "文件哈希用内置的纯净版值 " + gameHash.Text + "，点「一键启用」。"
+                        : "已按 " + defaultHashSource + " 算出文件哈希 " + gameHash.Text + "，点「一键启用」。";
                     if (waitingForOriginalIdent)
                         status.Text += " 机器码等原版客户端日志提供。";
                 }
@@ -267,26 +282,107 @@ namespace MoIdentityTool
                 else
                     status.Text = "准备好后点「一键启用」。";
             }
+
+            // 窗口一出现就自动接管，省掉一次点击。用户随时可以点「停止代理」。
+            Shown += (sender, args) =>
+            {
+                if (autoStarted)
+                    return;
+                autoStarted = true;
+                StartListening();
+            };
         }
 
-        /// <summary>文件哈希为空时，用纯净版目录算一次填进去。找不到参照目录就返回 false。</summary>
+        /// <summary>文件哈希为空时直接用内置的纯净版哈希；「参照目录」只在手动点「计算」时使用。</summary>
         private bool EnsureDefaultHash()
         {
             if (!string.IsNullOrWhiteSpace(gameHash.Text))
                 return false;
 
-            string reference = GuessReferenceRoot();
-            if (string.IsNullOrEmpty(reference))
-                return false;
-
-            string computed;
-            string error;
-            if (!GameFileHash.TryCompute(reference, out computed, out error))
-                return false;
-
-            gameHash.Text = computed;
-            defaultHashSource = reference;
+            gameHash.Text = GameFileHash.CleanInstallHash;
+            defaultHashSource = "内置的纯净版哈希";
+            defaultHashBuiltIn = true;
             return true;
+        }
+
+        /// <summary>按「参照目录」算一次文件哈希，目录为空时先提示补上。</summary>
+        private void ChooseReferenceRoot()
+        {
+            string reference = (hashRoot.Text ?? string.Empty).Trim();
+            if (reference.Length == 0)
+            {
+                status.Text = "先在「参照目录」里填游戏目录，例如 <游戏目录>\\Mental Omega。";
+                return;
+            }
+
+            string hash;
+            string error;
+            if (!GameFileHash.TryCompute(reference, out hash, out error))
+            {
+                status.Text = "计算文件哈希失败：" + error;
+                return;
+            }
+
+            gameHash.Text = hash;
+            defaultHashSource = reference;
+            status.Text = "已按 " + reference + " 算出文件哈希 " + hash + "。";
+        }
+
+        /// <summary>浏览选择参照用的游戏文件夹。</summary>
+        private void BrowseReferenceRoot()
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "选择参照用的游戏文件夹（里面应有 Resources\\FHCConfig.ini）";
+                dialog.ShowNewFolderButton = false;
+                string current = (hashRoot.Text ?? string.Empty).Trim();
+                if (current.Length > 0 && Directory.Exists(current))
+                    dialog.SelectedPath = current;
+
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                hashRoot.Text = dialog.SelectedPath;
+                ChooseReferenceRoot();
+            }
+        }
+
+        /// <summary>默认参照目录：工具同级的 Mental Omega；找不到就用工具所在目录。</summary>
+        private static string DefaultReferenceRoot()
+        {
+            string folder = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates =
+            {
+                folder,
+                Path.Combine(folder, "..", "Mental Omega"),
+                Path.Combine(folder, "Mental Omega"),
+                Path.Combine(folder, "..", "..", "Mental Omega")
+            };
+
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    string full = Path.GetFullPath(candidate);
+                    if (File.Exists(Path.Combine(full, GameFileHash.ConfigRelativePath)))
+                        return full;
+                }
+                catch (ArgumentException) { }
+                catch (NotSupportedException) { }
+            }
+
+            try
+            {
+                return Path.GetFullPath(Path.Combine(folder, "..", "Mental Omega"));
+            }
+            catch (ArgumentException)
+            {
+                return folder;
+            }
+            catch (NotSupportedException)
+            {
+                return folder;
+            }
         }
 
         /// <summary>上次异常退出可能残留 hosts 段落，启动时先清掉，否则游戏连不上服务器。</summary>
@@ -304,7 +400,7 @@ namespace MoIdentityTool
 
         private void SaveIdentity()
         {
-            try { preferences.Save(machine.Text, gameHash.Text); }
+            try { preferences.Save(machine.Text, gameHash.Text, hashRoot.Text); }
             catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
             {
                 MessageBox.Show(this, "保存识别码失败。" + error.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -400,58 +496,6 @@ namespace MoIdentityTool
             layout.Controls.Add(MakeButton(buttonText, handler), 2, row);
         }
 
-        /// <summary>选择参照用的游戏文件夹，按客户端算法算出房间文件校验值。</summary>
-        private void ChooseCleanInstall()
-        {
-            using (var dialog = new FolderBrowserDialog())
-            {
-                dialog.Description = "选择要作为参照的游戏文件夹（里面应有 Resources\\FHCConfig.ini）";
-                dialog.ShowNewFolderButton = false;
-                string guess = GuessReferenceRoot();
-                if (guess != null)
-                    dialog.SelectedPath = guess;
-
-                if (dialog.ShowDialog(this) != DialogResult.OK)
-                    return;
-
-                string hash;
-                string error;
-                if (!GameFileHash.TryCompute(dialog.SelectedPath, out hash, out error))
-                {
-                    status.Text = "计算文件哈希失败：" + error;
-                    return;
-                }
-
-                gameHash.Text = hash;
-                status.Text = "已按 " + dialog.SelectedPath + " 算出文件哈希 " + hash + "。";
-            }
-        }
-
-        /// <summary>猜一个参照安装的位置：工作区里通常有纯净版与修改版两个文件夹。</summary>
-        private static string GuessReferenceRoot()
-        {
-            string folder = AppDomain.CurrentDomain.BaseDirectory;
-            string[] candidates =
-            {
-                Path.Combine(folder, "..", "..", "纯净版MO", "Mental Omega"),
-                Path.Combine(folder, "..", "纯净版MO", "Mental Omega"),
-                Path.Combine(folder, "..", "..", "..", "纯净版MO", "Mental Omega")
-            };
-
-            foreach (string candidate in candidates)
-            {
-                try
-                {
-                    string full = Path.GetFullPath(candidate);
-                    if (File.Exists(Path.Combine(full, GameFileHash.ConfigRelativePath)))
-                        return full;
-                }
-                catch (ArgumentException) { }
-                catch (NotSupportedException) { }
-            }
-            return null;
-        }
-
         /// <summary>让说明、状态和按钮区横跨表格的所有列。</summary>
         private static void AddFullWidth(TableLayoutPanel layout, Control control, int row)
         {
@@ -483,30 +527,30 @@ namespace MoIdentityTool
         private void StartListening()
         {
             if (string.IsNullOrWhiteSpace(machine.Text))
-                machine.Text = IdentityProfile.RandomIdent();
+                machine.Text = CnCNetLogMonitor.FindLastSubmittedIdent(logPaths) ?? IdentityProfile.RandomIdent();
 
             if (string.IsNullOrWhiteSpace(upstreamHost.Text))
-                TakeUpstreamFromLog();
+                PrepareUpstream();
 
-            // 用户清空过文件哈希时，仍然按纯净版补齐，保证默认就会改写校验值。
+            // 用户清空过文件哈希时，默认补内置的纯净版哈希，保证一键启用就会改写校验值。
             EnsureDefaultHash();
 
             ApplyHosts();
             ApplyProfile();
         }
 
-        /// <summary>用日志里最后一次建连目标补齐上游地址。</summary>
-        private bool TakeUpstreamFromLog()
+        /// <summary>补齐上游地址：先看日志，再解析域名，最后退回内置地址。</summary>
+        private void PrepareUpstream()
         {
-            IPEndPoint target = CnCNetLogMonitor.FindLastTarget(logPaths);
-            if (target == null)
-                return false;
+            string host;
+            int port;
+            bool found = CnCNetTarget.TryFind(logPaths, out host, out port);
 
-            upstreamHost.Text = target.Address.ToString();
-            upstreamPort.Value = Math.Max(1, Math.Min(65535, target.Port));
-            AddPort(target.Port);
-            cncnetTarget.Text = "CnCNet 最近目标：" + target;
-            return true;
+            upstreamHost.Text = host;
+            upstreamPort.Value = Math.Max(1, Math.Min(65535, port));
+            AddPort(port);
+            if (!found)
+                status.Text = "没读到客户端日志，先按内置地址 " + host + ":" + port + " 转发。";
         }
 
         /// <summary>把服务器域名指向本机。没有管理员权限时只提示，不阻断改写。</summary>

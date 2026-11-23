@@ -30,7 +30,7 @@ try {
         $stagedFiles += $stagedDll, $stagedExe
         & $dotnet $compiler @options @references @defines /target:library ("/out:$stagedDll") IdentityRelay.cs GameFileHash.cs
         if ($LASTEXITCODE -ne 0) { throw "Could not build $name.dll." }
-        & $dotnet $compiler @options @references @uiReferences @defines /target:winexe ("/reference:$stagedDll") ("/out:$stagedExe") Program.cs CnCNetLogMonitor.cs IdentityPreferences.cs HostsRedirector.cs
+        & $dotnet $compiler @options @references @uiReferences @defines /target:winexe ("/reference:$stagedDll") ("/out:$stagedExe") Program.cs CnCNetLogMonitor.cs IdentityPreferences.cs HostsRedirector.cs CnCNetTarget.cs
         if ($LASTEXITCODE -ne 0) { throw "Could not build $name.exe." }
 
         $outputFiles["$name.dll"] = $stagedDll

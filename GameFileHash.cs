@@ -19,6 +19,12 @@ namespace MoIdentityTool
         /// <summary>客户端读取的文件清单，位于游戏根目录下的 Resources。</summary>
         public const string ConfigRelativePath = "Resources\\FHCConfig.ini";
 
+        /// <summary>
+        /// 纯净版 MO 2.6.10.3 客户端的校验值，按上面的规则对纯净版目录算出。
+        /// 参照目录算不出值时用它兜底，保证换台机器也能直接进纯净版房间。
+        /// </summary>
+        public const string CleanInstallHash = "097cd2574a6c6a805a5dbf5473d3bcd8dafd54ee";
+
         private const string SettingsSection = "Settings";
         private const string FileListSection = "FilenameList";
         private const string CalculateGameExeKey = "CalculateGameExeHash";
