@@ -58,32 +58,31 @@ namespace MoIdentityTool
         // 同时转发的连接上限，超出后直接关闭新连接。
         private const int MaxClients = 8;
 
-        // gate 同时保护连接集合和 disposed，界面线程与连接线程都会访问。
+        // gate 保护监听器、端口、活动连接和释放状态。
         private readonly List<TcpListener> listeners = new List<TcpListener>();
         private readonly List<int> ports = new List<int>();
         private readonly List<TcpClient> clients = new List<TcpClient>();
         private readonly object gate = new object();
-        // CTCP 包体以 \u0001 包裹，房间文件校验用的是 FHSH，指认作弊用的是 MM 与 IHSH。
+        // CTCP 包体以 \u0001 包裹，房间文件校验用的是 FHSH。
         private const string FileHashTag = "\u0001FHSH ";
 
         // UI 线程可更新配置，连接线程读取其引用。
         private volatile IdentityProfile profile;
         // 空串表示不改写文件校验值。
         private volatile string gameHash = string.Empty;
-        private readonly string upstreamHost;
-        private readonly int upstreamPort;
+        private volatile UpstreamTarget upstreamTarget;
         private bool disposed;
 
         /// <summary>监听启动后绑定的实际地址。</summary>
         public IPAddress Address { get; private set; }
         /// <summary>实际绑定成功的全部端口，按构造顺序排列。</summary>
-        public IReadOnlyList<int> Ports { get { return ports; } }
+        public IReadOnlyList<int> Ports { get { lock (gate) { return ports.ToArray(); } } }
         /// <summary>实际绑定成功的第一个端口。</summary>
-        public int Port { get { return ports.Count == 0 ? 0 : ports[0]; } }
+        public int Port { get { lock (gate) { return ports.Count == 0 ? 0 : ports[0]; } } }
         /// <summary>当前转发的上游主机名或地址。</summary>
-        public string UpstreamHost { get { return upstreamHost; } }
+        public string UpstreamHost { get { return upstreamTarget.Host; } }
         /// <summary>当前转发的上游端口。</summary>
-        public int UpstreamPort { get { return upstreamPort; } }
+        public int UpstreamPort { get { return upstreamTarget.Port; } }
         /// <summary>转发时替换房间文件校验值用的哈希，空串表示不改写。</summary>
         public string GameHash { get { return gameHash; } }
         /// <summary>转发过程中的记录，参数依次为时间、动作、对方、昵称、值、说明。</summary>
@@ -116,58 +115,83 @@ namespace MoIdentityTool
         {
             if (listenAddress == null)
                 throw new ArgumentNullException("listenAddress");
-            if (listenPorts == null)
-                throw new ArgumentNullException("listenPorts");
             if (initialProfile == null)
                 throw new ArgumentNullException("initialProfile");
+
+            profile = initialProfile;
+            Address = listenAddress;
+            ApplyUpstream(upstreamHost, upstreamPort);
+            ApplyGameHash(gameHash);
+            ApplyListenPorts(listenPorts);
+        }
+
+        /// <summary>更新新连接的上游；已经建立的连接继续使用原来的上游。</summary>
+        public void ApplyUpstream(string upstreamHost, int upstreamPort)
+        {
             if (string.IsNullOrWhiteSpace(upstreamHost))
                 throw new ArgumentException("上游服务器地址不能为空。", "upstreamHost");
             if (upstreamPort < 1 || upstreamPort > 65535)
                 throw new ArgumentException("上游服务器端口必须在 1 到 65535 之间。", "upstreamPort");
 
+            upstreamTarget = new UpstreamTarget(upstreamHost.Trim(), upstreamPort);
+        }
+
+        /// <summary>调整监听端口，复用保留的监听器并维持已建立的连接。</summary>
+        public void ApplyListenPorts(IEnumerable<int> listenPorts)
+        {
+            if (listenPorts == null)
+                throw new ArgumentNullException("listenPorts");
+
             int[] wanted = listenPorts.Where(port => port >= 0 && port <= 65535).Distinct().ToArray();
             if (wanted.Length == 0)
                 throw new ArgumentException("监听端口必须在 1 到 65535 之间。", "listenPorts");
 
-            profile = initialProfile;
-            this.upstreamHost = upstreamHost.Trim();
-            this.upstreamPort = upstreamPort;
-            Address = listenAddress;
-            ApplyGameHash(gameHash);
-
-            foreach (int candidate in wanted)
+            lock (gate)
             {
-                TcpListener listener = null;
-                try
+                if (disposed)
+                    throw new ObjectDisposedException(nameof(IdentityRelay));
+
+                var selected = new List<TcpListener>();
+                var added = new List<TcpListener>();
+                foreach (int candidate in wanted)
                 {
-                    listener = new TcpListener(listenAddress, candidate);
-                    listener.ExclusiveAddressUse = true;
-                    listener.Start(MaxClients);
-                }
-                catch (SocketException error)
-                {
-                    if (listener != null)
+                    int existing = ports.IndexOf(candidate);
+                    if (existing >= 0)
                     {
-                        try { listener.Stop(); }
-                        catch (SocketException) { }
-                        catch (ObjectDisposedException) { }
+                        selected.Add(listeners[existing]);
+                        continue;
                     }
 
-                    // 端口被别的程序占着不影响其它端口，记一条记录继续。
-                    Report("端口跳过", listenAddress + ":" + candidate, string.Empty, candidate.ToString(), error.Message);
-                    continue;
+                    TcpListener listener = new TcpListener(Address, candidate);
+                    try
+                    {
+                        listener.ExclusiveAddressUse = true;
+                        listener.Start(MaxClients);
+                    }
+                    catch (SocketException)
+                    {
+                        StopListener(listener);
+                        continue;
+                    }
+
+                    selected.Add(listener);
+                    added.Add(listener);
                 }
 
-                listeners.Add(listener);
-                ports.Add(((IPEndPoint)listener.LocalEndpoint).Port);
+                if (selected.Count == 0)
+                    throw new InvalidOperationException("这些端口都无法监听：" +
+                        string.Join("、", wanted.Select(port => port.ToString()).ToArray()) + "，可能已被其它程序占用。");
+
+                foreach (TcpListener listener in listeners.Except(selected))
+                    StopListener(listener);
+                listeners.Clear();
+                listeners.AddRange(selected);
+                ports.Clear();
+                ports.AddRange(selected.Select(listener => ((IPEndPoint)listener.LocalEndpoint).Port));
+
+                foreach (TcpListener listener in added)
+                    AcceptClients(listener);
             }
-
-            if (listeners.Count == 0)
-                throw new InvalidOperationException("这些端口都无法监听：" +
-                    string.Join("、", wanted.Select(port => port.ToString()).ToArray()) + "，可能已被其它程序占用。");
-
-            foreach (TcpListener listener in listeners)
-                AcceptClients(listener);
         }
 
         /// <summary>替换改写用的机器码。后续每一个 USER 行都会使用新值。</summary>
@@ -210,7 +234,7 @@ namespace MoIdentityTool
 
                 lock (gate)
                 {
-                    if (disposed || clients.Count >= MaxClients)
+                    if (disposed || !listeners.Contains(listener) || clients.Count >= MaxClients)
                     {
                         client.Close();
                         continue;
@@ -226,20 +250,22 @@ namespace MoIdentityTool
         private async void Relay(TcpClient client)
         {
             string remote = Describe(client);
+            UpstreamTarget target = upstreamTarget;
+            string targetAddress = target.Host + ":" + target.Port;
             TcpClient upstream = null;
             try
             {
                 upstream = new TcpClient();
-                await upstream.ConnectAsync(upstreamHost, upstreamPort).ConfigureAwait(false);
-                var state = new RelayState();
-                Report("连接转入", remote, string.Empty, upstreamHost + ":" + upstreamPort, "开始转发");
-                Task fromClient = Pump(client, upstream, true, remote, state);
-                Task toClient = Pump(upstream, client, false, remote, state);
+                await upstream.ConnectAsync(target.Host, target.Port).ConfigureAwait(false);
+                var state = new RelayState(targetAddress);
+                Report("连接转入", remote, string.Empty, targetAddress, "开始转发");
+                Task fromClient = Pump(client, upstream, true, state);
+                Task toClient = Pump(upstream, client, false, state);
                 await Task.WhenAny(fromClient, toClient).ConfigureAwait(false);
             }
             catch (SocketException error)
             {
-                Report("上游连接失败", remote, string.Empty, upstreamHost + ":" + upstreamPort, error.Message);
+                Report("上游连接失败", remote, string.Empty, targetAddress, error.Message);
             }
             finally
             {
@@ -250,7 +276,7 @@ namespace MoIdentityTool
         }
 
         /// <summary>按行转发一个方向的数据。rewrite 为 true 时改写客户端发出的 USER 行。</summary>
-        private async Task Pump(TcpClient from, TcpClient to, bool rewrite, string remote, RelayState state)
+        private async Task Pump(TcpClient from, TcpClient to, bool rewrite, RelayState state)
         {
             StreamReader reader;
             StreamWriter writer;
@@ -319,7 +345,7 @@ namespace MoIdentityTool
             if (string.Equals(replaced, original, StringComparison.Ordinal))
                 return line;
 
-            Report("改写 USER", upstreamHost + ":" + upstreamPort, state.Nick, replaced, original);
+            Report("改写 USER", state.Upstream, state.Nick, replaced, original);
             return line.Substring(0, identStart) + replaced + line.Substring(identEnd);
         }
 
@@ -369,7 +395,7 @@ namespace MoIdentityTool
             if (string.Equals(original, target, StringComparison.OrdinalIgnoreCase))
                 return line;
 
-            Report("改写文件哈希", upstreamHost + ":" + upstreamPort, state.Nick, target, original);
+            Report("改写文件哈希", state.Upstream, state.Nick, target, original);
             return line.Substring(0, start) + target + line.Substring(end);
         }
 
@@ -403,7 +429,7 @@ namespace MoIdentityTool
 
             state.Hostname = hostname;
             state.Ident = ident;
-            Report("服务器识别码", upstreamHost + ":" + upstreamPort, state.Nick, ident, hostname);
+            Report("服务器识别码", state.Upstream, state.Nick, ident, hostname);
         }
 
         /// <summary>向观察者推送一条转发记录。</summary>
@@ -438,6 +464,13 @@ namespace MoIdentityTool
             catch (ObjectDisposedException) { }
         }
 
+        private static void StopListener(TcpListener listener)
+        {
+            try { listener.Stop(); }
+            catch (SocketException) { }
+            catch (InvalidOperationException) { }
+        }
+
         /// <summary>停止全部监听并关闭转发连接。重复调用会直接返回。</summary>
         public void Dispose()
         {
@@ -455,22 +488,36 @@ namespace MoIdentityTool
             }
 
             foreach (TcpListener listener in stopping)
-            {
-                try { listener.Stop(); }
-                catch (SocketException) { }
-                catch (InvalidOperationException) { }
-            }
+                StopListener(listener);
 
             foreach (TcpClient client in snapshot)
                 Close(client);
         }
 
+        private sealed class UpstreamTarget
+        {
+            public readonly string Host;
+            public readonly int Port;
+
+            public UpstreamTarget(string host, int port)
+            {
+                Host = host;
+                Port = port;
+            }
+        }
+
         /// <summary>单个转发连接内共享的状态，用于记录昵称与服务器分配的识别码。</summary>
         private sealed class RelayState
         {
+            public readonly string Upstream;
             public string Nick = string.Empty;
             public string Ident;
             public string Hostname;
+
+            public RelayState(string upstream)
+            {
+                Upstream = upstream;
+            }
         }
     }
 }

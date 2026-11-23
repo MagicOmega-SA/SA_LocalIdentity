@@ -69,8 +69,8 @@ namespace MoIdentityTool
             return null;
         }
 
-        /// <summary>从最近改动的日志里找出最后一次建连目标，供一键启用时自动填写上游。</summary>
-        internal static IPEndPoint FindLastTarget(string[] paths)
+        /// <summary>从最近改动的日志里找出最后一次建连目标，可跳过本机代理地址。</summary>
+        internal static IPEndPoint FindLastTarget(string[] paths, bool upstreamOnly = false)
         {
             foreach (string path in paths.OrderByDescending(File.GetLastWriteTimeUtc))
             {
@@ -91,7 +91,8 @@ namespace MoIdentityTool
                         {
                             Match match = ConnectionLine.Match(line);
                             IPEndPoint endpoint;
-                            if (match.Success && TryReadEndpoint(match, out endpoint))
+                            if (match.Success && TryReadEndpoint(match, out endpoint) &&
+                                (!upstreamOnly || CnCNetTarget.IsUpstreamAddress(endpoint.Address)))
                                 last = endpoint;
                         }
                         if (last != null)

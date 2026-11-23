@@ -39,7 +39,7 @@ namespace MoIdentityTool
             host = DefaultHost;
             port = DefaultPort;
 
-            IPEndPoint logged = CnCNetLogMonitor.FindLastTarget(logPaths);
+            IPEndPoint logged = CnCNetLogMonitor.FindLastTarget(logPaths, upstreamOnly: true);
             if (logged != null)
             {
                 host = logged.Address.ToString();
@@ -57,6 +57,15 @@ namespace MoIdentityTool
             return false;
         }
 
+        internal static bool IsUpstreamAddress(IPAddress address)
+        {
+            if (address.IsIPv4MappedToIPv6)
+                address = address.MapToIPv4();
+
+            return !IPAddress.IsLoopback(address) && !address.Equals(IPAddress.Any) &&
+                !address.Equals(IPAddress.IPv6Any);
+        }
+
         /// <summary>在本机 DNS 还能正常解析时取出服务器的 IPv4 地址。</summary>
         public static bool TryResolveDns(out string address)
         {
@@ -71,7 +80,7 @@ namespace MoIdentityTool
                         if (candidate.AddressFamily != AddressFamily.InterNetwork)
                             continue;
                         // hosts 已经把它指到本机时不能用，那会把代理指成回环。
-                        if (IPAddress.IsLoopback(candidate))
+                        if (!IsUpstreamAddress(candidate))
                             continue;
 
                         address = candidate.ToString();

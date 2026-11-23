@@ -35,6 +35,7 @@ namespace MoIdentityTool
             @"Attempting to DNS resolve [^()]*\((?<host>[A-Za-z0-9][A-Za-z0-9.\-]*)\)",
             RegexOptions.CultureInvariant);
         private static readonly Regex IPv4Literal = new Regex(@"\A\d{1,3}(?:\.\d{1,3}){3}\z", RegexOptions.CultureInvariant);
+        private static readonly Regex LineBoundary = new Regex(@"(?<=\n)|(?<=\r)(?!\n)", RegexOptions.CultureInvariant);
 
         /// <summary>系统 hosts 文件路径。</summary>
         internal static string HostsPath
@@ -67,7 +68,8 @@ namespace MoIdentityTool
         /// <summary>判断 hosts 内容里是否已经带着本工具写入的段落。</summary>
         internal static bool ContainsBlock(string content)
         {
-            return !string.IsNullOrEmpty(content) && content.IndexOf(BeginMarker, StringComparison.Ordinal) >= 0;
+            return !string.IsNullOrEmpty(content) && LineBoundary.Split(content).Any(line =>
+                line.Trim() == BeginMarker || line.Trim() == EndMarker);
         }
 
         /// <summary>去掉本工具写入的段落，保留其它内容。</summary>
@@ -76,25 +78,31 @@ namespace MoIdentityTool
             if (string.IsNullOrEmpty(content))
                 return content ?? string.Empty;
 
-            var kept = new List<string>();
+            var kept = new StringBuilder(content.Length);
             bool inside = false;
-            foreach (string line in content.Replace("\r\n", "\n").Split('\n'))
+            foreach (string line in LineBoundary.Split(content))
             {
                 string trimmed = line.Trim();
                 if (trimmed == BeginMarker)
                 {
+                    if (inside)
+                        throw new InvalidDataException("hosts 中的 SA_LocalIdentity 段落含有重复起始标记。");
                     inside = true;
-                    continue;
                 }
-                if (trimmed == EndMarker)
+                else if (trimmed == EndMarker)
                 {
+                    if (!inside)
+                        throw new InvalidDataException("hosts 中的 SA_LocalIdentity 段落缺少起始标记。");
                     inside = false;
-                    continue;
                 }
-                if (!inside)
-                    kept.Add(line);
+                else if (!inside)
+                {
+                    kept.Append(line);
+                }
             }
-            return string.Join("\r\n", kept.ToArray());
+            if (inside)
+                throw new InvalidDataException("hosts 中的 SA_LocalIdentity 段落缺少结束标记。");
+            return kept.ToString();
         }
 
         /// <summary>把指定域名全部指向 127.0.0.1，替换掉旧的同名段落。</summary>
@@ -139,12 +147,15 @@ namespace MoIdentityTool
             {
                 string original = File.Exists(path) ? File.ReadAllText(path) : string.Empty;
                 string updated = AddBlock(original, hostnames);
-                SaveBackup(original);
-                WriteAllText(path, updated);
+                if (updated != original)
+                {
+                    SaveBackup(path, original);
+                    WriteAllText(path, updated);
+                }
                 error = null;
                 return true;
             }
-            catch (Exception failure) when (failure is IOException || failure is UnauthorizedAccessException ||
+            catch (Exception failure) when (failure is IOException || failure is InvalidDataException || failure is UnauthorizedAccessException ||
                                             failure is SecurityException || failure is NotSupportedException)
             {
                 error = failure.Message;
@@ -166,7 +177,7 @@ namespace MoIdentityTool
                 WriteAllText(path, RemoveBlock(original));
                 return true;
             }
-            catch (Exception failure) when (failure is IOException || failure is UnauthorizedAccessException ||
+            catch (Exception failure) when (failure is IOException || failure is InvalidDataException || failure is UnauthorizedAccessException ||
                                             failure is SecurityException || failure is NotSupportedException)
             {
                 error = failure.Message;
@@ -235,11 +246,13 @@ namespace MoIdentityTool
             return Normalize(found);
         }
 
-        private static void SaveBackup(string original)
+        private static void SaveBackup(string path, string original)
         {
             try
             {
-                string backup = BackupPath;
+                string backup = string.Equals(path, HostsPath, StringComparison.OrdinalIgnoreCase)
+                    ? BackupPath
+                    : path + ".backup.txt";
                 if (File.Exists(backup))
                     return;
                 string folder = Path.GetDirectoryName(backup);
@@ -253,21 +266,25 @@ namespace MoIdentityTool
 
         private static void WriteAllText(string path, string content)
         {
+            string staged = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             FileAttributes attributes = FileAttributes.Normal;
             bool restoreAttributes = false;
-            if (File.Exists(path))
+            try
             {
+                File.WriteAllText(staged, content, Utf8NoBom);
+                if (!File.Exists(path))
+                {
+                    File.Move(staged, path);
+                    return;
+                }
+
                 attributes = File.GetAttributes(path);
                 if ((attributes & FileAttributes.ReadOnly) != 0)
                 {
                     File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
                     restoreAttributes = true;
                 }
-            }
-
-            try
-            {
-                File.WriteAllText(path, content, Utf8NoBom);
+                File.Replace(staged, path, null);
             }
             finally
             {
@@ -277,6 +294,7 @@ namespace MoIdentityTool
                     catch (IOException) { }
                     catch (UnauthorizedAccessException) { }
                 }
+                File.Delete(staged);
             }
         }
     }

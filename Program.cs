@@ -108,6 +108,7 @@ namespace MoIdentityTool
         private readonly Timer logPollTimer = new Timer { Interval = 750 };
         private readonly CnCNetLogMonitor[] logMonitors;
         private readonly string[] logPaths;
+        private readonly string hostsPath;
         private readonly IdentityPreferences preferences;
         private readonly CheckBox autoApply = new CheckBox { Text = "自动跟随建连日志", AutoSize = true };
         private readonly Button start = new Button { Text = "一键启用", AutoSize = true };
@@ -125,13 +126,16 @@ namespace MoIdentityTool
 #endif
         private readonly bool elevated;
         private IdentityRelay relay;
-        private string appliedPorts = string.Empty;
+        private int[] requestedPorts = new int[0];
         private string defaultHashSource = string.Empty;
         private bool defaultHashBuiltIn;
         private bool autoStarted;
         private bool waitingForOriginalIdent;
         private bool hostsApplied;
         private int hostCount;
+        private string hostsError;
+        private string appliedIdent = string.Empty;
+        private string appliedHash = string.Empty;
 
         /// <summary>创建界面、绑定操作，并恢复上次关闭时的识别码。</summary>
         public IdentityForm()
@@ -141,8 +145,14 @@ namespace MoIdentityTool
         }
 
         internal IdentityForm(string[] clientLogPaths, string settingsPath, bool elevated)
+            : this(clientLogPaths, settingsPath, elevated, HostsRedirector.HostsPath)
+        {
+        }
+
+        internal IdentityForm(string[] clientLogPaths, string settingsPath, bool elevated, string hostsPath)
         {
             this.elevated = elevated;
+            this.hostsPath = hostsPath;
             logPaths = clientLogPaths;
             Text = "心灵终结识别码测试工具";
             StartPosition = FormStartPosition.CenterScreen;
@@ -183,7 +193,7 @@ namespace MoIdentityTool
             layout.Controls.Add(upstreamHost, 1, 3);
             layout.Controls.Add(upstreamPort, 2, 3);
             AddField(layout, 4, "机器码", machine, () => machine.Text = IdentityProfile.RandomIdent());
-            AddField(layout, 5, "文件哈希", gameHash, "计算", ChooseReferenceRoot);
+            AddField(layout, 5, "文件哈希", gameHash, "计算", ChooseReferenceRoot, "填入纯净哈希", FillBuiltInHash);
             AddField(layout, 6, "参照目录", hashRoot, "浏览", BrowseReferenceRoot);
 
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
@@ -260,10 +270,13 @@ namespace MoIdentityTool
             IPEndPoint last = CnCNetLogMonitor.FindLastTarget(clientLogPaths);
             if (last != null)
             {
-                upstreamHost.Text = last.Address.ToString();
-                upstreamPort.Value = last.Port;
-                AddPort(last.Port);
                 cncnetTarget.Text = "CnCNet 最近目标：" + last;
+                if (CnCNetTarget.IsUpstreamAddress(last.Address))
+                {
+                    upstreamHost.Text = last.Address.ToString();
+                    upstreamPort.Value = last.Port;
+                    AddPort(last.Port);
+                }
             }
 
             waitingForOriginalIdent = string.IsNullOrWhiteSpace(machine.Text);
@@ -328,6 +341,15 @@ namespace MoIdentityTool
             status.Text = "已按 " + reference + " 算出文件哈希 " + hash + "。";
         }
 
+        /// <summary>把内置的纯净版哈希填进「文件哈希」。</summary>
+        private void FillBuiltInHash()
+        {
+            gameHash.Text = GameFileHash.CleanInstallHash;
+            defaultHashSource = "内置的纯净版哈希";
+            defaultHashBuiltIn = true;
+            status.Text = "已填入内置的纯净版哈希 " + gameHash.Text + "。";
+        }
+
         /// <summary>浏览选择参照用的游戏文件夹。</summary>
         private void BrowseReferenceRoot()
         {
@@ -388,14 +410,13 @@ namespace MoIdentityTool
         /// <summary>上次异常退出可能残留 hosts 段落，启动时先清掉，否则游戏连不上服务器。</summary>
         private void CleanupStaleHosts()
         {
-            if (!elevated || !HostsRedirector.IsManaged(HostsRedirector.HostsPath))
+            if (!elevated || !HostsRedirector.IsManaged(hostsPath))
                 return;
 
-            string error;
-            if (HostsRedirector.Revert(HostsRedirector.HostsPath, out error))
+            hostsApplied = true;
+            if (RevertHosts())
                 status.Text = "已清理上次退出时残留的 hosts 条目。";
-            else
-                status.Text = "清理残留 hosts 失败：" + error;
+            UpdateServerButtons();
         }
 
         private void SaveIdentity()
@@ -428,15 +449,18 @@ namespace MoIdentityTool
 
         private void FillListeningEndpoint(IPEndPoint remote)
         {
-            // 已在改写时保留用户设定，避免新日志打断正在使用的连接。
-            if (relay == null)
-            {
-                upstreamHost.Text = remote.Address.ToString();
-                upstreamPort.Value = Math.Max(1, Math.Min(65535, remote.Port));
-                AddPort(remote.Port);
-            }
+            if (!CnCNetTarget.IsUpstreamAddress(remote.Address) || (relay != null && !autoApply.Checked))
+                return;
 
-            if (autoApply.Checked)
+            upstreamHost.Text = remote.Address.ToString();
+            upstreamPort.Value = remote.Port;
+            AddPort(remote.Port);
+            if (!autoApply.Checked)
+                return;
+
+            if (relay == null)
+                StartListening();
+            else
                 ApplyProfile();
         }
 
@@ -496,6 +520,18 @@ namespace MoIdentityTool
             layout.Controls.Add(MakeButton(buttonText, handler), 2, row);
         }
 
+        /// <summary>在指定行放置一个输入字段，右侧并排放两个按钮。</summary>
+        private static void AddField(TableLayoutPanel layout, int row, string name, TextBox field,
+            string firstText, Action first, string secondText, Action second)
+        {
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoSize = true, Margin = Padding.Empty };
+            buttons.Controls.Add(MakeButton(firstText, first));
+            buttons.Controls.Add(MakeButton(secondText, second));
+            layout.Controls.Add(MakeLabel(name), 0, row);
+            layout.Controls.Add(field, 1, row);
+            layout.Controls.Add(buttons, 2, row);
+        }
+
         /// <summary>让说明、状态和按钮区横跨表格的所有列。</summary>
         private static void AddFullWidth(TableLayoutPanel layout, Control control, int row)
         {
@@ -523,7 +559,7 @@ namespace MoIdentityTool
             machine.Text = IdentityProfile.RandomIdent();
         }
 
-        /// <summary>一键启用：补齐识别码与上游，接管 hosts，然后开始改写。</summary>
+        /// <summary>一键启用：补齐识别码与上游，先绑定端口，成功后再接管 hosts 并开始改写。</summary>
         private void StartListening()
         {
             if (string.IsNullOrWhiteSpace(machine.Text))
@@ -535,8 +571,17 @@ namespace MoIdentityTool
             // 用户清空过文件哈希时，默认补内置的纯净版哈希，保证一键启用就会改写校验值。
             EnsureDefaultHash();
 
+            // 先绑端口再改 hosts：代理起不来就把 hosts 撤掉，游戏继续连真服务器。
+            if (!ApplyProfile())
+            {
+                if (relay == null)
+                    RevertHosts();
+                UpdateServerButtons();
+                return;
+            }
+
             ApplyHosts();
-            ApplyProfile();
+            RefreshListenStatus();
         }
 
         /// <summary>补齐上游地址：先看日志，再解析域名，最后退回内置地址。</summary>
@@ -556,6 +601,7 @@ namespace MoIdentityTool
         /// <summary>把服务器域名指向本机。没有管理员权限时只提示，不阻断改写。</summary>
         private void ApplyHosts()
         {
+            hostsError = null;
             if (!elevated)
             {
                 hostsApplied = false;
@@ -565,33 +611,54 @@ namespace MoIdentityTool
 
             string[] hostnames = HostsRedirector.MergeHostnames(HostsRedirector.HostnamesFromLogs(logPaths));
             string error;
-            if (HostsRedirector.Apply(HostsRedirector.HostsPath, hostnames, out error))
+            if (HostsRedirector.Apply(hostsPath, hostnames, out error))
             {
                 hostsApplied = true;
                 hostCount = hostnames.Length;
             }
             else
             {
-                hostsApplied = false;
-                hostCount = 0;
-                status.Text = "写 hosts 失败：" + error;
+                hostsError = "写 hosts 失败：" + error;
             }
         }
 
         /// <summary>删除本工具写入的 hosts 段落。</summary>
-        private void RevertHosts()
+        private bool RevertHosts()
         {
             if (!hostsApplied)
-                return;
+                return true;
 
             string error;
-            if (!HostsRedirector.Revert(HostsRedirector.HostsPath, out error))
+            if (!HostsRedirector.Revert(hostsPath, out error))
             {
-                status.Text = "还原 hosts 失败：" + error + "。请手动删除 " + HostsRedirector.BeginMarker +
-                    " 到 " + HostsRedirector.EndMarker + " 之间的行。";
+                status.Text = "还原 hosts 失败：" + error + " 请检查 hosts 中的 SA_LocalIdentity 标记段。";
+                return false;
             }
             hostsApplied = false;
             hostCount = 0;
+            return true;
+        }
+
+        /// <summary>按当前代理与 hosts 状态重写状态栏，绑定成功后调用。</summary>
+        private void RefreshListenStatus()
+        {
+            if (relay == null)
+                return;
+
+            IReadOnlyList<int> activePorts = relay.Ports;
+            status.Text = "正在改写 " + relay.Address + ":" + string.Join(",", activePorts) + " → 上游 " + relay.UpstreamHost + ":" +
+                relay.UpstreamPort + "，识别码 " + appliedIdent + "。";
+            int[] skipped = requestedPorts.Except(activePorts).ToArray();
+            if (skipped.Length > 0)
+                status.Text += " 未监听端口：" + string.Join(",", skipped) + "。";
+            if (appliedHash.Length > 0)
+                status.Text += " 房间文件哈希按 " + appliedHash.Substring(0, 8) + "… 上报。";
+            if (hostsError != null)
+                status.Text += " " + hostsError;
+            else if (hostsApplied)
+                status.Text += " 已把 " + hostCount + " 个服务器域名指向本机，退出时自动还原。";
+            else if (!elevated)
+                status.Text += " 未以管理员运行，未改 hosts；需要手动把服务器域名指向 127.0.0.1。";
         }
 
         /// <summary>按服务运行状态切换开始与停止按钮的可用性。</summary>
@@ -599,18 +666,18 @@ namespace MoIdentityTool
         {
             bool running = relay != null;
             start.Enabled = !running;
-            stop.Enabled = running;
+            stop.Enabled = running || hostsApplied;
         }
 
-        /// <summary>校验并应用界面中的设置，按需创建或复用改写代理。</summary>
-        private void ApplyProfile()
+        /// <summary>校验并应用界面中的设置，按需创建或复用改写代理。返回是否已成功绑定。</summary>
+        private bool ApplyProfile()
         {
             IPAddress address;
             if (!IPAddress.TryParse(listenAddress.Text.Trim(), out address))
             {
                 status.Text = "请输入有效的 IPv4 或 IPv6 监听地址。";
                 UpdateServerButtons();
-                return;
+                return false;
             }
 
             string portsError;
@@ -619,7 +686,7 @@ namespace MoIdentityTool
             {
                 status.Text = portsError;
                 UpdateServerButtons();
-                return;
+                return false;
             }
 
             string upstream = upstreamHost.Text.Trim();
@@ -628,19 +695,19 @@ namespace MoIdentityTool
             {
                 status.Text = "请填写上游 CnCNet 服务器地址，或先让客户端连一次，工具会从日志自动填入。";
                 UpdateServerButtons();
-                return;
+                return false;
             }
             if (IsUnderHostsRedirect(upstream))
             {
                 status.Text = "上游地址不能填已被 hosts 指向本机的域名，请填服务器的真实 IP。";
                 UpdateServerButtons();
-                return;
+                return false;
             }
             if (IsSelfLoop(address, ports, upstream, upstreamPortValue))
             {
                 status.Text = "上游服务器指向了本机同一端口，会形成回环。请填写真实服务器地址与端口。";
                 UpdateServerButtons();
-                return;
+                return false;
             }
 
             // 在更新服务前构造经过校验的配置。输入有误时只显示验证信息。
@@ -653,7 +720,7 @@ namespace MoIdentityTool
             {
                 status.Text = error.Message;
                 UpdateServerButtons();
-                return;
+                return false;
             }
 
             // 回填规范化后的字段，例如把六位十六进制简写扩展为 MO.XXXXXX。
@@ -663,19 +730,13 @@ namespace MoIdentityTool
             {
                 status.Text = "文件哈希请填 40 位十六进制，或点「计算」从游戏文件夹生成；留空则只改机器码。";
                 UpdateServerButtons();
-                return;
+                return false;
             }
             hashValue = hashValue.ToLowerInvariant();
             gameHash.Text = hashValue;
-            string portsKey = string.Join(",", ports.Select(value => value.ToString()).ToArray());
             try
             {
-                bool changed = relay == null ||
-                    !address.Equals(relay.Address) ||
-                    !string.Equals(portsKey, appliedPorts, StringComparison.Ordinal) ||
-                    !relay.UpstreamHost.Equals(upstream, StringComparison.OrdinalIgnoreCase) ||
-                    relay.UpstreamPort != upstreamPortValue;
-                if (changed)
+                if (relay == null || !address.Equals(relay.Address))
                 {
                     // 新代理构造成功后才替换旧代理。绑定失败时旧连接仍可使用。
                     var created = new IdentityRelay(address, ports, requested, upstream, upstreamPortValue, hashValue);
@@ -689,38 +750,40 @@ namespace MoIdentityTool
                 }
                 else
                 {
+                    if (!requestedPorts.SequenceEqual(ports) || relay.Ports.Count < ports.Length)
+                        relay.ApplyListenPorts(ports);
+                    relay.ApplyUpstream(upstream, upstreamPortValue);
                     relay.Apply(requested);
                     relay.ApplyGameHash(hashValue);
                 }
 
-                appliedPorts = portsKey;
+                requestedPorts = ports;
+                appliedIdent = requested.Ident;
+                appliedHash = hashValue;
                 listenAddress.Text = relay.Address.ToString();
-                status.Text = "正在改写 " + relay.Address + ":" + appliedPorts + " → 上游 " + relay.UpstreamHost + ":" +
-                    relay.UpstreamPort + "，识别码 " + requested.Ident + "。";
-                if (hashValue.Length > 0)
-                    status.Text += " 房间文件哈希按 " + hashValue.Substring(0, 8) + "… 上报，进房间不会再报文件不一致。";
-                if (hostsApplied)
-                    status.Text += " 已把 " + hostCount + " 个服务器域名指向本机，退出时自动还原。";
-                else if (!elevated)
-                    status.Text += " 未以管理员运行，未改 hosts；需要手动把服务器域名指向 127.0.0.1。";
+                RefreshListenStatus();
                 UpdateServerButtons();
+                return true;
             }
             catch (SocketException error)
             {
-                status.Text = "无法监听 " + address + ":" + appliedPorts + "。" + error.Message;
+                status.Text = "无法监听 " + address + ":" + string.Join(",", ports) + "。" + error.Message;
                 if (relay != null)
                     status.Text += " 当前仍在监听 " + relay.Address + ":" + string.Join(",", relay.Ports.Select(value => value.ToString()).ToArray()) + "。";
                 UpdateServerButtons();
+                return false;
             }
             catch (InvalidOperationException error)
             {
                 status.Text = error.Message;
                 UpdateServerButtons();
+                return false;
             }
             catch (ArgumentException error)
             {
                 status.Text = error.Message;
                 UpdateServerButtons();
+                return false;
             }
         }
 
@@ -795,10 +858,11 @@ namespace MoIdentityTool
                 relay = null;
             }
 
-            bool reverted = hostsApplied;
-            RevertHosts();
+            bool hadHosts = hostsApplied;
+            bool restored = RevertHosts();
             UpdateServerButtons();
-            status.Text = reverted ? "代理已停止，hosts 已还原。" : "代理已停止。";
+            if (restored)
+                status.Text = hadHosts ? "代理已停止，hosts 已还原。" : "代理已停止。";
         }
     }
 }
